@@ -59,6 +59,8 @@ class RTC_EXPORT VideoDecoderFactory {
   // migrated to `Create`.
   virtual std::unique_ptr<VideoDecoder> CreateVideoDecoder(
       const SdpVideoFormat& format);
+
+  virtual bool ShouldParseReceiveQp() const;
 };
 
 }  // namespace webrtc

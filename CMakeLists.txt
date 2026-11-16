@@ -84,6 +84,21 @@ init_target(tg_owt)
 
 generate_field_trials(tg_owt)
 
+set(TG_OWT_DAV1D_INCLUDE_PATH "" CACHE PATH "Include path for dav1d.")
+if (NOT TG_OWT_DAV1D_INCLUDE_PATH STREQUAL "")
+    if (NOT EXISTS "${TG_OWT_DAV1D_INCLUDE_PATH}/dav1d/dav1d.h")
+        message(FATAL_ERROR "TG_OWT_DAV1D_INCLUDE_PATH must contain dav1d/dav1d.h.")
+    endif()
+    file(COPY "${TG_OWT_DAV1D_INCLUDE_PATH}/dav1d"
+        DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/dav1d/third_party/dav1d/libdav1d/include")
+    target_include_directories(tg_owt PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/dav1d")
+    nice_target_sources(tg_owt ${webrtc_loc}
+    PRIVATE
+        modules/video_coding/codecs/av1/dav1d_decoder.cc
+        modules/video_coding/codecs/av1/dav1d_decoder.h
+    )
+endif()
+
 if (TG_OWT_USE_PIPEWIRE)
     if (TG_OWT_DLOPEN_PIPEWIRE)
         include(cmake/generate_stubs.cmake)
