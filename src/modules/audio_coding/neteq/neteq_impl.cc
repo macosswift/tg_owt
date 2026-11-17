@@ -922,7 +922,6 @@ int NetEqImpl::GetAudioInternal(AudioFrame* audio_frame,
       Decode(&packet_list, &operation, &length, &speech_type);
   const bool missed_decode = decode_return_value == kDecoderPending && started_playout_;
   if (missed_decode) {
-    if (auto* decoder = decoder_database_->GetActiveDecoder()) decoder->Reset();
     packet_list.clear();
     last_decoded_packet_infos_.clear();
     length = 0;
