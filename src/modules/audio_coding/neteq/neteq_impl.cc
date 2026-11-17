@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "api/audio_codecs/audio_decoder.h"
 #include "api/neteq/neteq_controller.h"
 #include "api/neteq/tick_timer.h"
@@ -49,10 +50,23 @@
 #include "rtc_base/sanitizer.h"
 #include "rtc_base/strings/audio_format_to_string.h"
 #include "rtc_base/trace_event.h"
+#include "rtc_base/time_utils.h"
 #include "system_wrappers/include/clock.h"
 #include "system_wrappers/include/field_trial.h"
 
 namespace webrtc {
+
+struct NetEqImpl::PendingPlayout {
+  PacketList packets;
+  absl::optional<uint8_t> payload_type;
+  DtmfEvent dtmf;
+  Operation operation;
+  bool play_dtmf;
+  size_t packet_count;
+  int decoded_length;
+  AudioDecoder::SpeechType speech;
+};
+
 namespace {
 
 std::unique_ptr<NetEqController> CreateNetEqController(
@@ -199,10 +213,40 @@ int NetEqImpl::InsertPacket(const RTPHeader& rtp_header,
   rtc::MsanCheckInitialized(payload);
   TRACE_EVENT0("webrtc", "NetEqImpl::InsertPacket");
   MutexLock lock(&mutex_);
-  if (InsertPacketInternal(rtp_header, payload) != 0) {
-    return kFail;
+  int status = kDecoderPending;
+  if (!pending_playout_ && startup_packets_.empty() && !(first_packet_ && DecoderStarting(rtp_header.payloadType))) {
+    status = InsertPacketInternal(rtp_header, payload);
   }
-  return kOK;
+  if (status == kDecoderPending) {
+    if (payload.empty() || payload.size() > 65536 || startup_packets_.size() >= 200 || startup_bytes_ + payload.size() > 1048576) return kFail;
+    startup_packets_.push_back({rtp_header, rtc::Buffer(payload.data(), payload.size())});
+    startup_bytes_ += payload.size();
+    return kOK;
+  }
+  return status == 0 ? kOK : kFail;
+}
+
+bool NetEqImpl::DecoderStarting(uint8_t payload_type) {
+  const auto* info = decoder_database_->GetDecoderInfo(payload_type);
+  if (!info || info->IsComfortNoise() || info->IsDtmf() || decoder_database_->IsRed(payload_type)) return false;
+  auto* decoder = info->GetDecoder();
+  return decoder && decoder->ErrorCode() == AudioDecoder::kTemporarilyUnavailable;
+}
+
+void NetEqImpl::DiscardStartupPackets(int payload_type) {
+  if (pending_playout_ && (payload_type < 0 || pending_playout_->payload_type == payload_type || std::any_of(pending_playout_->packets.begin(), pending_playout_->packets.end(), [payload_type](const Packet& packet) { return packet.payload_type == payload_type; }))) {
+    pending_playout_.reset();
+    last_decoded_packet_infos_.clear();
+    reset_decoder_ = true;
+  }
+  for (auto it = startup_packets_.begin(); it != startup_packets_.end();) {
+    if (payload_type < 0 || it->header.payloadType == payload_type) {
+      startup_bytes_ -= it->payload.size();
+      it = startup_packets_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void NetEqImpl::InsertEmptyPacket(const RTPHeader& rtp_header) {
@@ -248,6 +292,7 @@ void NetEqImpl::SetCodecs(const std::map<int, SdpAudioFormat>& codecs) {
       decoder_database_->SetCodecs(codecs);
   for (const int pt : changed_payload_types) {
     packet_buffer_->DiscardPacketsWithPayloadType(pt);
+    DiscardStartupPackets(pt);
   }
 }
 
@@ -266,6 +311,7 @@ int NetEqImpl::RemovePayloadType(uint8_t rtp_payload_type) {
   int ret = decoder_database_->Remove(rtp_payload_type);
   if (ret == DecoderDatabase::kOK || ret == DecoderDatabase::kDecoderNotFound) {
     packet_buffer_->DiscardPacketsWithPayloadType(rtp_payload_type);
+    DiscardStartupPackets(rtp_payload_type);
     return kOK;
   }
   return kFail;
@@ -273,6 +319,7 @@ int NetEqImpl::RemovePayloadType(uint8_t rtp_payload_type) {
 
 void NetEqImpl::RemoveAllPayloadTypes() {
   MutexLock lock(&mutex_);
+  DiscardStartupPackets(-1);
   decoder_database_->RemoveAll();
 }
 
@@ -410,6 +457,8 @@ absl::optional<NetEq::DecoderFormat> NetEqImpl::GetDecoderFormat(
 void NetEqImpl::FlushBuffers() {
   MutexLock lock(&mutex_);
   RTC_LOG(LS_VERBOSE) << "FlushBuffers";
+  DiscardStartupPackets(-1);
+  started_playout_ = false;
   packet_buffer_->Flush();
   RTC_DCHECK(sync_buffer_.get());
   RTC_DCHECK(expand_.get());
@@ -471,7 +520,6 @@ int NetEqImpl::InsertPacketInternal(const RTPHeader& rtp_header,
   }
 
   Timestamp receive_time = clock_->CurrentTime();
-  stats_->ReceivedPacket();
 
   PacketList packet_list;
   // Insert packet in a packet list.
@@ -505,6 +553,42 @@ int NetEqImpl::InsertPacketInternal(const RTPHeader& rtp_header,
   uint8_t main_payload_type = packet_list.front().payload_type;
   uint16_t main_sequence_number = packet_list.front().sequence_number;
 
+  // Check for RED payload type, and separate payloads into several packets.
+  if (decoder_database_->IsRed(rtp_header.payloadType)) {
+    if (!red_payload_splitter_->SplitRed(&packet_list)) {
+      return kRedundancySplitError;
+    }
+    // Only accept a few RED payloads of the same type as the main data,
+    // DTMF events and CNG.
+    red_payload_splitter_->CheckRedPayloads(&packet_list, *decoder_database_);
+    if (packet_list.empty()) {
+      return kRedundancySplitError;
+    }
+  }
+
+  // Check payload types.
+  if (decoder_database_->CheckPayloadTypes(packet_list) ==
+      DecoderDatabase::kDecoderNotFound) {
+    return kUnknownRtpPayloadType;
+  }
+
+  if (decoder_database_->IsRed(rtp_header.payloadType)) {
+    timestamp_scaler_->ToInternal(&packet_list);
+  }
+  absl::InlinedVector<std::vector<AudioDecoder::ParseResult>, 1> prepared;
+  for (auto& packet : packet_list) {
+    const auto* info = decoder_database_->GetDecoderInfo(packet.payload_type);
+    if (info->IsComfortNoise() || info->IsDtmf()) continue;
+    auto* decoder = info->GetDecoder();
+    auto results = decoder->ParsePayload(std::move(packet.payload), packet.timestamp);
+    if (results.empty()) {
+      const int error = decoder->ErrorCode();
+      if (error == AudioDecoder::kPayloadPending || error == AudioDecoder::kTemporarilyUnavailable) return kDecoderPending;
+    }
+    prepared.push_back(std::move(results));
+  }
+  stats_->ReceivedPacket();
+
   // Reinitialize NetEq if it's needed (changed SSRC or first call).
   if (update_sample_rate_and_channels) {
     // Note: `first_packet_` will be cleared further down in this method, once
@@ -529,31 +613,11 @@ int NetEqImpl::InsertPacketInternal(const RTPHeader& rtp_header,
     nack_->UpdateLastReceivedPacket(main_sequence_number, main_timestamp);
   }
 
-  // Check for RED payload type, and separate payloads into several packets.
-  if (decoder_database_->IsRed(rtp_header.payloadType)) {
-    if (!red_payload_splitter_->SplitRed(&packet_list)) {
-      return kRedundancySplitError;
-    }
-    // Only accept a few RED payloads of the same type as the main data,
-    // DTMF events and CNG.
-    red_payload_splitter_->CheckRedPayloads(&packet_list, *decoder_database_);
-    if (packet_list.empty()) {
-      return kRedundancySplitError;
-    }
-  }
-
-  // Check payload types.
-  if (decoder_database_->CheckPayloadTypes(packet_list) ==
-      DecoderDatabase::kDecoderNotFound) {
-    return kUnknownRtpPayloadType;
-  }
-
   RTC_DCHECK(!packet_list.empty());
 
   // Update main_timestamp, if new packets appear in the list
   // after RED splitting.
   if (decoder_database_->IsRed(rtp_header.payloadType)) {
-    timestamp_scaler_->ToInternal(&packet_list);
     main_timestamp = packet_list.front().timestamp;
     main_payload_type = packet_list.front().payload_type;
     main_sequence_number = packet_list.front().sequence_number;
@@ -564,7 +628,6 @@ int NetEqImpl::InsertPacketInternal(const RTPHeader& rtp_header,
   PacketList::iterator it = packet_list.begin();
   while (it != packet_list.end()) {
     const Packet& current_packet = (*it);
-    RTC_DCHECK(!current_packet.payload.empty());
     if (decoder_database_->IsDtmf(current_packet.payload_type)) {
       DtmfEvent event;
       int ret = DtmfBuffer::ParseEvent(current_packet.timestamp,
@@ -584,6 +647,7 @@ int NetEqImpl::InsertPacketInternal(const RTPHeader& rtp_header,
 
   PacketList parsed_packet_list;
   bool is_dtx = false;
+  size_t prepared_index = 0;
   while (!packet_list.empty()) {
     Packet& packet = packet_list.front();
     const DecoderDatabase::DecoderInfo* info =
@@ -616,9 +680,7 @@ int NetEqImpl::InsertPacketInternal(const RTPHeader& rtp_header,
         return new_packet;
       };
 
-      std::vector<AudioDecoder::ParseResult> results =
-          info->GetDecoder()->ParsePayload(std::move(packet.payload),
-                                           packet.timestamp);
+      auto results = std::move(prepared[prepared_index++]);
       if (results.empty()) {
         packet_list.pop_front();
       } else {
@@ -775,47 +837,69 @@ bool NetEqImpl::MaybeChangePayloadType(uint8_t payload_type) {
 int NetEqImpl::GetAudioInternal(AudioFrame* audio_frame,
                                 bool* muted,
                                 absl::optional<Operation> action_override) {
+  if (!pending_playout_ && !startup_packets_.empty()) {
+    const int64_t deadline = rtc::TimeMicros() + 1000;
+    do {
+      const auto& packet = startup_packets_.front();
+      int status = DecoderStarting(packet.header.payloadType) ? kDecoderPending : InsertPacketInternal(packet.header, packet.payload);
+      if (status == kDecoderPending) break;
+      startup_bytes_ -= packet.payload.size();
+      startup_packets_.pop_front();
+      if (status != 0) return kOtherError;
+    } while (!startup_packets_.empty() && rtc::TimeMicros() < deadline);
+    if (first_packet_ && !startup_packets_.empty()) {
+      auto* decoder = decoder_database_->GetDecoder(startup_packets_.front().header.payloadType);
+      audio_frame->Reset();
+      audio_frame->sample_rate_hz_ = decoder ? decoder->SampleRateHz() : fs_hz_;
+      audio_frame->samples_per_channel_ = audio_frame->sample_rate_hz_ / 100;
+      audio_frame->num_channels_ = decoder ? decoder->Channels() : sync_buffer_->Channels();
+      *muted = true;
+      return 0;
+    }
+  }
   PacketList packet_list;
   DtmfEvent dtmf_event;
   Operation operation;
   bool play_dtmf;
   *muted = false;
-  last_decoded_packet_infos_.clear();
-  tick_timer_->Increment();
-  stats_->IncreaseCounter(output_size_samples_, fs_hz_);
-  const auto lifetime_stats = stats_->GetLifetimeStatistics();
-  expand_uma_logger_.UpdateSampleCounter(lifetime_stats.concealed_samples,
-                                         fs_hz_);
-  speech_expand_uma_logger_.UpdateSampleCounter(
-      lifetime_stats.concealed_samples -
-          lifetime_stats.silent_concealed_samples,
-      fs_hz_);
+  if (!pending_playout_) {
+    last_decoded_packet_infos_.clear();
+    tick_timer_->Increment();
+    stats_->IncreaseCounter(output_size_samples_, fs_hz_);
+    const auto lifetime_stats = stats_->GetLifetimeStatistics();
+    expand_uma_logger_.UpdateSampleCounter(lifetime_stats.concealed_samples,
+                                           fs_hz_);
+    speech_expand_uma_logger_.UpdateSampleCounter(
+        lifetime_stats.concealed_samples -
+            lifetime_stats.silent_concealed_samples,
+        fs_hz_);
 
-  // Check for muted state.
-  if (enable_muted_state_ && expand_->Muted() && packet_buffer_->Empty()) {
-    RTC_DCHECK_EQ(last_mode_, Mode::kExpand);
-    audio_frame->Reset();
-    RTC_DCHECK(audio_frame->muted());  // Reset() should mute the frame.
-    playout_timestamp_ += static_cast<uint32_t>(output_size_samples_);
-    audio_frame->sample_rate_hz_ = fs_hz_;
-    // Make sure the total number of samples fits in the AudioFrame.
-    if (output_size_samples_ * sync_buffer_->Channels() >
-        AudioFrame::kMaxDataSizeSamples) {
-      return kSampleUnderrun;
+    // Check for muted state.
+    if (enable_muted_state_ && expand_->Muted() && packet_buffer_->Empty()) {
+      RTC_DCHECK_EQ(last_mode_, Mode::kExpand);
+      audio_frame->Reset();
+      RTC_DCHECK(audio_frame->muted());  // Reset() should mute the frame.
+      playout_timestamp_ += static_cast<uint32_t>(output_size_samples_);
+      audio_frame->sample_rate_hz_ = fs_hz_;
+      // Make sure the total number of samples fits in the AudioFrame.
+      if (output_size_samples_ * sync_buffer_->Channels() >
+          AudioFrame::kMaxDataSizeSamples) {
+        return kSampleUnderrun;
+      }
+      audio_frame->samples_per_channel_ = output_size_samples_;
+      audio_frame->timestamp_ =
+          first_packet_
+              ? 0
+              : timestamp_scaler_->ToExternal(playout_timestamp_) -
+                    static_cast<uint32_t>(audio_frame->samples_per_channel_);
+      audio_frame->num_channels_ = sync_buffer_->Channels();
+      stats_->ExpandedNoiseSamples(output_size_samples_, false);
+      controller_->NotifyMutedState();
+      *muted = true;
+      return 0;
     }
-    audio_frame->samples_per_channel_ = output_size_samples_;
-    audio_frame->timestamp_ =
-        first_packet_
-            ? 0
-            : timestamp_scaler_->ToExternal(playout_timestamp_) -
-                  static_cast<uint32_t>(audio_frame->samples_per_channel_);
-    audio_frame->num_channels_ = sync_buffer_->Channels();
-    stats_->ExpandedNoiseSamples(output_size_samples_, false);
-    controller_->NotifyMutedState();
-    *muted = true;
-    return 0;
   }
-  int return_value = GetDecision(&operation, &packet_list, &dtmf_event,
+  int return_value = pending_playout_ ? 0 : GetDecision(&operation, &packet_list, &dtmf_event,
                                  &play_dtmf, action_override);
   if (return_value != 0) {
     last_mode_ = Mode::kError;
@@ -824,10 +908,48 @@ int NetEqImpl::GetAudioInternal(AudioFrame* audio_frame,
 
   AudioDecoder::SpeechType speech_type;
   int length = 0;
-  const size_t start_num_packets = packet_list.size();
+  size_t start_num_packets = packet_list.size();
+  if (pending_playout_) {
+    packet_list.swap(pending_playout_->packets);
+    dtmf_event = pending_playout_->dtmf;
+    operation = pending_playout_->operation;
+    play_dtmf = pending_playout_->play_dtmf;
+    start_num_packets = pending_playout_->packet_count;
+    length = pending_playout_->decoded_length;
+    speech_type = pending_playout_->speech;
+  }
   int decode_return_value =
       Decode(&packet_list, &operation, &length, &speech_type);
+  const bool missed_decode = decode_return_value == kDecoderPending && started_playout_;
+  if (missed_decode) {
+    if (auto* decoder = decoder_database_->GetActiveDecoder()) decoder->Reset();
+    packet_list.clear();
+    last_decoded_packet_infos_.clear();
+    length = 0;
+    operation = Operation::kExpand;
+    speech_type = AudioDecoder::kSpeech;
+    decode_return_value = 0;
+  }
+  if (decode_return_value == kDecoderPending) {
+    if (!pending_playout_) pending_playout_ = std::make_unique<PendingPlayout>();
+    pending_playout_->packets.swap(packet_list);
+    pending_playout_->payload_type = current_rtp_payload_type_;
+    pending_playout_->dtmf = dtmf_event;
+    pending_playout_->operation = operation;
+    pending_playout_->play_dtmf = play_dtmf;
+    pending_playout_->packet_count = start_num_packets;
+    pending_playout_->decoded_length = length;
+    pending_playout_->speech = speech_type;
+    audio_frame->Reset();
+    audio_frame->sample_rate_hz_ = fs_hz_;
+    audio_frame->samples_per_channel_ = output_size_samples_;
+    audio_frame->num_channels_ = sync_buffer_->Channels();
+    *muted = true;
+    return 0;
+  }
+  pending_playout_.reset();
   if (length > 0) {
+    started_playout_ = true;
     last_decoded_type_ = speech_type;
   }
 
@@ -860,7 +982,7 @@ int NetEqImpl::GetAudioInternal(AudioFrame* audio_frame,
     }
     case Operation::kExpand: {
       RTC_DCHECK_EQ(return_value, 0);
-      if (!current_rtp_payload_type_ || !DoCodecPlc()) {
+      if (missed_decode || !current_rtp_payload_type_ || !DoCodecPlc()) {
         return_value = DoExpand(play_dtmf);
       }
       RTC_DCHECK_GE(sync_buffer_->FutureLength() - expand_->overlap_length(),
@@ -1314,13 +1436,13 @@ int NetEqImpl::Decode(PacketList* packet_list,
                       Operation* operation,
                       int* decoded_length,
                       AudioDecoder::SpeechType* speech_type) {
-  *speech_type = AudioDecoder::kSpeech;
+  if (!pending_playout_) *speech_type = AudioDecoder::kSpeech;
 
   // When packet_list is empty, we may be in kCodecInternalCng mode, and for
   // that we use current active decoder.
   AudioDecoder* decoder = decoder_database_->GetActiveDecoder();
 
-  if (!packet_list->empty()) {
+  if (!pending_playout_ && !packet_list->empty()) {
     const Packet& packet = packet_list->front();
     uint8_t payload_type = packet.payload_type;
     if (!decoder_database_->IsComfortNoise(payload_type)) {
@@ -1372,9 +1494,9 @@ int NetEqImpl::Decode(PacketList* packet_list,
     reset_decoder_ = false;
   }
 
-  *decoded_length = 0;
+  if (!pending_playout_) *decoded_length = 0;
   // Update codec-internal PLC state.
-  if ((*operation == Operation::kMerge) && decoder && decoder->HasDecodePlc()) {
+  if (!pending_playout_ && (*operation == Operation::kMerge) && decoder && decoder->HasDecodePlc()) {
     decoder->DecodePlc(1, &decoded_buffer_[*decoded_length]);
   }
 
@@ -1386,6 +1508,8 @@ int NetEqImpl::Decode(PacketList* packet_list,
     return_value = DecodeLoop(packet_list, *operation, decoder, decoded_length,
                               speech_type);
   }
+
+  if (return_value == kDecoderPending) return return_value;
 
   if (*decoded_length < 0) {
     // Error returned from the decoder.
@@ -1432,6 +1556,7 @@ int NetEqImpl::DecodeCng(AudioDecoder* decoder,
         nullptr, 0, fs_hz_,
         (decoded_buffer_length_ - *decoded_length) * sizeof(int16_t),
         &decoded_buffer_[*decoded_length], speech_type);
+    if (length < 0 && decoder->ErrorCode() == AudioDecoder::kPayloadPending) return kDecoderPending;
     if (length > 0) {
       *decoded_length += length;
     } else {
@@ -1455,7 +1580,7 @@ int NetEqImpl::DecodeLoop(PacketList* packet_list,
                           AudioDecoder* decoder,
                           int* decoded_length,
                           AudioDecoder::SpeechType* speech_type) {
-  RTC_DCHECK(last_decoded_packet_infos_.empty());
+  RTC_DCHECK(pending_playout_ || last_decoded_packet_infos_.empty());
 
   // Do decoding.
   while (!packet_list->empty() && !decoder_database_->IsComfortNoise(
@@ -1474,6 +1599,7 @@ int NetEqImpl::DecodeLoop(PacketList* packet_list,
     auto opt_result = packet_list->front().frame->Decode(
         rtc::ArrayView<int16_t>(&decoded_buffer_[*decoded_length],
                                 decoded_buffer_length_ - *decoded_length));
+    if (!opt_result && decoder->ErrorCode() == AudioDecoder::kPayloadPending) return kDecoderPending;
     if (packet_list->front().packet_info) {
       last_decoded_packet_infos_.push_back(*packet_list->front().packet_info);
     }

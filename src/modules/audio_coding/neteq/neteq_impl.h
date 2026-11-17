@@ -11,6 +11,7 @@
 #ifndef MODULES_AUDIO_CODING_NETEQ_NETEQ_IMPL_H_
 #define MODULES_AUDIO_CODING_NETEQ_NETEQ_IMPL_H_
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -24,6 +25,7 @@
 #include "api/neteq/neteq_controller_factory.h"
 #include "api/neteq/tick_timer.h"
 #include "api/rtp_packet_info.h"
+#include "api/rtp_headers.h"
 #include "modules/audio_coding/neteq/audio_multi_vector.h"
 #include "modules/audio_coding/neteq/expand_uma_logger.h"
 #include "modules/audio_coding/neteq/packet.h"
@@ -85,7 +87,8 @@ class NetEqImpl : public webrtc::NetEq {
     kSampleUnderrun,
     kDecodedTooMuch,
     kRedundancySplitError,
-    kPacketBufferCorruption
+    kPacketBufferCorruption,
+    kDecoderPending
   };
 
   struct Dependencies {
@@ -346,6 +349,17 @@ class NetEqImpl : public webrtc::NetEq {
   const std::unique_ptr<DtmfBuffer> dtmf_buffer_ RTC_GUARDED_BY(mutex_);
   const std::unique_ptr<DtmfToneGenerator> dtmf_tone_generator_
       RTC_GUARDED_BY(mutex_);
+  struct StartupPacket {
+    RTPHeader header;
+    rtc::Buffer payload;
+  };
+  struct PendingPlayout;
+  std::unique_ptr<PendingPlayout> pending_playout_ RTC_GUARDED_BY(mutex_);
+  bool started_playout_ RTC_GUARDED_BY(mutex_) = false;
+  std::deque<StartupPacket> startup_packets_ RTC_GUARDED_BY(mutex_);
+  size_t startup_bytes_ RTC_GUARDED_BY(mutex_) = 0;
+  bool DecoderStarting(uint8_t payload_type) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void DiscardStartupPackets(int payload_type) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   const std::unique_ptr<PacketBuffer> packet_buffer_ RTC_GUARDED_BY(mutex_);
   const std::unique_ptr<RedPayloadSplitter> red_payload_splitter_
       RTC_GUARDED_BY(mutex_);

@@ -894,6 +894,7 @@ PRIVATE
     modules/audio_coding/codecs/opus/audio_coder_opus_common.cc
     modules/audio_coding/codecs/opus/audio_decoder_multi_channel_opus_impl.cc
     modules/audio_coding/codecs/opus/audio_decoder_opus.cc
+    modules/audio_coding/codecs/opus/audio_decoder_opus_config.cc
     modules/audio_coding/codecs/opus/audio_encoder_multi_channel_opus_impl.cc
     modules/audio_coding/codecs/opus/audio_encoder_opus.cc
     modules/audio_coding/codecs/opus/opus_interface.cc

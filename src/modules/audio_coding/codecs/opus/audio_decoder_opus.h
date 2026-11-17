@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "api/audio_codecs/audio_decoder.h"
+#include "api/field_trials_view.h"
 #include "modules/audio_coding/codecs/opus/opus_interface.h"
 #include "rtc_base/buffer.h"
 
@@ -26,6 +27,8 @@ class AudioDecoderOpusImpl final : public AudioDecoder {
  public:
   explicit AudioDecoderOpusImpl(size_t num_channels,
                                 int sample_rate_hz = 48000);
+  AudioDecoderOpusImpl(size_t num_channels, int sample_rate_hz,
+                       const FieldTrialsView& field_trials);
   ~AudioDecoderOpusImpl() override;
 
   AudioDecoderOpusImpl(const AudioDecoderOpusImpl&) = delete;

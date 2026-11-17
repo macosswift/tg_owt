@@ -31,7 +31,7 @@ class AudioDecoder {
   };
 
   // Used by PacketDuration below. Save the value -1 for errors.
-  enum { kNotImplemented = -2 };
+  enum { kNotImplemented = -2, kTemporarilyUnavailable = -3, kPayloadPending = -4 };
 
   AudioDecoder() = default;
   virtual ~AudioDecoder() = default;
