@@ -2318,6 +2318,10 @@ OSStatus AudioDeviceMac::implInDeviceIOProc(const AudioBufferList* inputData,
     return 0;
   }
 
+  if (inputData->mNumberBuffers == 0 || inputData->mBuffers->mData == NULL) {
+    return 0;
+  }
+
   ring_buffer_size_t bufSizeSamples =
       PaUtil_GetRingBufferReadAvailable(_paCaptureBuffer);
 
