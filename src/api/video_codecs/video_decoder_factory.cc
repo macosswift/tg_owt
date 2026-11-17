@@ -42,4 +42,8 @@ std::unique_ptr<VideoDecoder> VideoDecoderFactory::CreateVideoDecoder(
   return nullptr;
 }
 
+bool VideoDecoderFactory::ShouldParseReceiveQp() const {
+  return true;
+}
+
 }  // namespace webrtc
